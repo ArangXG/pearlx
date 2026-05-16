@@ -31,12 +31,11 @@ def hex_dump(data: bytes, label="") -> str:
 def make_frame(body: bytes) -> bytes:
     return struct.pack(">I", len(body)) + body
 
-def make_frame_int32(type_id: int, payload_bytes: bytes) -> bytes:
-    """Build frame with int32-encoded type_id (matches pool's exact wire format)."""
-    # Pool sends: 92 d2 XXXXXXXX [payload]
-    # 0x92 = fixarray[2], 0xd2 = int32 marker
-    body = b'\x92' + b'\xd2' + struct.pack('>i', type_id) + payload_bytes
-    return struct.pack(">I", len(body)) + body
+def make_body_int32(type_id: int, payload_bytes: bytes) -> bytes:
+    """Build frame BODY only (no length prefix) with int32-encoded type_id."""
+    # Correct format: fixarray[2] + int32(type_id) + payload
+    # probe() will add the 4-byte length prefix via make_frame()
+    return b'\x92' + b'\xd2' + struct.pack('>i', type_id) + payload_bytes
 
 async def probe(name: str, body: bytes, timeout=4):
     print(f"\n{'='*60}")
@@ -77,7 +76,8 @@ async def main():
 
     # ── All tests use int32 type_id encoding ─────────────────────────────────
     def p(payload):
-        return make_frame_int32(0, msgpack.packb(payload, use_bin_type=True))
+        # make_body_int32 returns body ONLY, probe() adds length prefix
+        return make_body_int32(0, msgpack.packb(payload, use_bin_type=True))
 
     await probe("INT32-A: type_id=int32, payload=[wallet,worker,ver]",
         p([wallet, worker, ver]))
@@ -100,7 +100,7 @@ async def main():
     # ── Extra: try different type_id values in case 0 is wrong ───────────────
     print("\n🔍 Testing type_id=1 (in case RegisterRequest=1, not 0)...")
     await probe("INT32-G: type_id=1, payload=[wallet,worker,ver]",
-        make_frame_int32(1, msgpack.packb([wallet, worker, ver], use_bin_type=True)))
+        make_body_int32(1, msgpack.packb([wallet, worker, ver], use_bin_type=True)))
 
     print("\n" + "="*60)
     print("  ✅ Format that gets RegisterResponse (type=1) = CORRECT!")
