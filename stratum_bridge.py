@@ -51,6 +51,7 @@ POOL_PORT     = 3333
 LOCAL_PORT    = 13333
 MINER_VERSION = "akoya-miner/1.0.0"
 MAX_FRAME     = 8192
+DEFAULT_WALLET = "prl1p4jkvta2rrj2w87tv6e4x38rspn92ucvztv8tywr6y4p772gu5n4stuf3kk"
 
 # ── Message Type IDs (enum order from binary analysis) ────────────────────────
 T_REGISTER_REQUEST        = 0
@@ -580,7 +581,7 @@ async def main():
     parser.add_argument("--port",     type=int, default=LOCAL_PORT,  help="Local Stratum listen port")
     parser.add_argument("--upstream", type=str, default=POOL_HOST,   help="Pool host")
     parser.add_argument("--up-port",  type=int, default=POOL_PORT,   help="Pool port")
-    parser.add_argument("--wallet",   type=str, default="",          help="Your Pearl wallet address")
+    parser.add_argument("--wallet",   type=str, default=DEFAULT_WALLET, help="Your Pearl wallet address")
     parser.add_argument("--worker",   type=str, default="worker1",   help="Worker name")
     parser.add_argument("--debug",    action="store_true",           help="Show debug logs")
     args = parser.parse_args()
