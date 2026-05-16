@@ -370,7 +370,10 @@ class StratumSession:
 # ── Pool Receive Loop ─────────────────────────────────────────────────────────
 async def pool_recv_loop(pool: PoolConnection, session: StratumSession):
     """Receive messages from pool and translate back to Stratum for miner."""
-    heartbeat_interval = 30
+    # Heartbeat disabled: we don't know exact format yet (wrong format = instant disconnect)
+    # Pool tolerates ~5 min without heartbeat. Will re-enable once format is confirmed.
+    HEARTBEAT_DISABLED = True
+    heartbeat_interval = 600
     last_heartbeat = time.time()
 
     while True:
