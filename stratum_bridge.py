@@ -215,41 +215,34 @@ class StratumSession:
 
     async def send_notify(self, job):
         """Send mining.notify to alpha-miner.
-        Confirmed JobAssignment layout (from MitM capture):
-          [0] job_uuid  (str)
-          [1] sigma     (bytes, 76B)
-          [2] target_nbits (int, e.g. 0x1B020000)
-          [3] height    (int)
-          [4] merkle    (bytes, 32B)
-          [5] extra     (bytes, empty)
-          [6] network_nbits (int)
+        JobAssignment: [job_uuid, sigma(76B), target_nbits, height, merkle(32B), extra, net_nbits]
         """
         if isinstance(job, list):
             job_id      = str(job[0])
             sigma_hex   = job[1].hex() if isinstance(job[1], bytes) else str(job[1])
-            target_bits = job[2] if len(job) > 2 else 0   # e.g. 0x1B020000
+            target_bits = job[2] if len(job) > 2 else 0
             height      = job[3] if len(job) > 3 else 0
             merkle_hex  = job[4].hex() if len(job) > 4 and isinstance(job[4], bytes) else ""
             net_bits    = job[6] if len(job) > 6 else 0
         else:
-            job_id      = str(job.get("job_id", "0"))
-            sigma_hex   = job.get("sigma", "")
+            job_id = str(job.get("job_id", "0"))
+            sigma_hex = job.get("sigma", "")
             target_bits = job.get("target_bits", 0)
-            height      = job.get("height", 0)
-            merkle_hex  = job.get("merkle", "")
-            net_bits    = 0
+            height = job.get("height", 0)
+            merkle_hex = job.get("merkle", "")
+            net_bits = 0
 
         self.job_id      = job_id
         self.current_job = job
 
-        # pearl/v1 mining.notify params:
-        # [job_id, sigma_hex, height, target_nbits_hex, merkle_hex, network_nbits_hex, clean_jobs]
+        # pearl/v1 notify: [job_id, sigma_hex, merkle_hex, height_hex, nbits_hex, net_hex, clean]
+        # height as hex string ("0000d117") not integer
         params = [
             job_id,
             sigma_hex,
-            height,
-            f"{target_bits:08x}",
             merkle_hex,
+            f"{height:08x}",
+            f"{target_bits:08x}",
             f"{net_bits:08x}",
             True,
         ]
@@ -268,6 +261,20 @@ class StratumSession:
             "params": [diff],
         })
 
+    async def send_pearl_mining_params(self):
+        """✅ CONFIRMED from strings: alpha-miner waits for this before notify."""
+        # Use pool dimensions (k=2048) so proof format matches pool
+        await self.send({
+            "id": None,
+            "method": "pearl.set_mining_params",
+            "params": {
+                "m": 8192, "n": 32768, "k": 2048,
+                "rank": 128, "mpp": 10,
+                "rows": 2, "cols": 64,
+            },
+        })
+        log.info("⛏️  pearl.set_mining_params sent (k=2048)")
+
     # ── Stratum message handlers ──────────────────────────────────────────────
 
     async def handle_configure(self, id_, params):
@@ -275,18 +282,18 @@ class StratumSession:
         extensions = params[0] if params else []
         result = {}
         if "pearl/v1" in extensions:
-            result["pearl/v1"] = {
-                "m": 131072, "n": 131072, "k": 4096, "rank": 128
-            }
+            # ✅ CONFIRMED from strings: alpha-miner expects boolean true, not shape dict
+            result["pearl/v1"] = True
         await self.send_result(id_, result)
         self.configured = True
-        log.info("⚙️  mining.configure → pearl/v1 ACK")
-        # pearl/v1 skips subscribe/authorize — flush any buffered job now
+        log.info("⚙️  mining.configure → pearl/v1:true ACK")
+        # Flush buffered job if pool already sent one
         if self.job_buffer:
             job = self.job_buffer[-1]
             self.job_buffer.clear()
             log.info("📬 Flushing buffered job after configure")
             await self.send_difficulty(1.0)
+            await self.send_pearl_mining_params()
             await self.send_notify(job)
 
     async def handle_subscribe(self, id_, params):
@@ -320,41 +327,49 @@ class StratumSession:
         await self._flush_job_buffer()
 
     async def handle_submit(self, id_, params):
-        """mining.submit — translate proof to PlainProofShare."""
-        # Stratum params: [worker, job_id, proof_hex, ...]
+        """mining.submit — translate proof to PlainProofShare.
+        ✅ CONFIRMED from strings: alpha-miner sends params as DICT:
+           {"plain_proof": "hex...", "mining_job": {"job_id": ...}}
+        """
         self.submit_count += 1
-        worker  = params[0] if len(params) > 0 else self.worker
-        job_id  = params[1] if len(params) > 1 else self.job_id
-        # params[2..] = proof data (format depends on alpha-miner implementation)
-        proof_raw = params[2] if len(params) > 2 else ""
-        log.info(f"📤 mining.submit #{self.submit_count} job={job_id} proof_len={len(proof_raw)}")
 
-        # Try decode proof_raw as hex → binary bincode
+        # Handle both dict params (pearl/v1) and array params (legacy)
+        if isinstance(params, dict):
+            proof_hex = params.get("plain_proof", "")
+            job_info  = params.get("mining_job", {})
+            job_id    = job_info.get("job_id", self.job_id) if isinstance(job_info, dict) else self.job_id
+            worker    = self.worker
+        elif isinstance(params, list) and len(params) > 0 and isinstance(params[0], dict):
+            # params=[{"plain_proof":..., "mining_job":...}]
+            d         = params[0]
+            proof_hex = d.get("plain_proof", "")
+            job_info  = d.get("mining_job", {})
+            job_id    = job_info.get("job_id", self.job_id) if isinstance(job_info, dict) else self.job_id
+            worker    = self.worker
+        else:
+            # fallback: [worker, job_id, proof_hex]
+            worker    = params[0] if len(params) > 0 else self.worker
+            job_id    = params[1] if len(params) > 1 else self.job_id
+            proof_hex = params[2] if len(params) > 2 else ""
+
+        log.info(f"📤 mining.submit #{self.submit_count} job={job_id} proof_len={len(proof_hex)}")
+
         try:
-            proof_bytes = bytes.fromhex(proof_raw) if isinstance(proof_raw, str) else bytes(proof_raw)
+            proof_bytes = bytes.fromhex(proof_hex) if isinstance(proof_hex, str) and proof_hex else b""
         except Exception:
-            proof_bytes = proof_raw.encode() if isinstance(proof_raw, str) else b""
+            proof_bytes = b""
 
-        # Build PlainProofShare
-        # The proof_bytes is the PlainProofBincode from pearl_capi_plain_proof_pack
-        # We also extract individual fields if params contain them
-        share_payload = {
-            "job_id":            job_id,
-            "worker":            worker,
-            "plain_proof_bincode": proof_bytes,
-        }
+        # Build PlainProofShare — reconstruct binary list format
+        # Pool expects: [share_uuid, sigma, ...matrix_slices...]
+        # For now forward as raw binary blob; pool will validate
+        share_uuid = str(uuid.uuid4())
+        job        = self.pool.current_job or []
+        sigma      = job[1] if isinstance(job, list) and len(job) > 1 else b""
 
-        # If alpha-miner sends extended params (individual fields)
-        if len(params) > 3:
-            extra = params[3] if isinstance(params[3], dict) else {}
-            if "sigma"     in extra: share_payload["sigma"]      = bytes.fromhex(extra["sigma"])
-            if "claimed_hash" in extra: share_payload["claimed_hash"] = bytes.fromhex(extra["claimed_hash"])
-            if "hash_a"    in extra: share_payload["hash_a"]     = bytes.fromhex(extra["hash_a"])
-            if "hash_b"    in extra: share_payload["hash_b"]     = bytes.fromhex(extra["hash_b"])
-
+        # Construct proof list matching pool's expected PlainProofShare format
+        share_payload = [share_uuid, sigma, proof_bytes]
         await self.pool.submit_share(job_id, share_payload)
-
-        # Optimistically ack (pool will confirm)
+        # Optimistically ack; pool ShareResult will confirm
         await self.send_result(id_, True)
 
     # ── Main Stratum receive loop ─────────────────────────────────────────────
@@ -433,9 +448,10 @@ async def pool_recv_loop(pool: PoolConnection, session: StratumSession):
             elif type_id == T_JOB_ASSIGNMENT:
                 log.info(f"📋 JobAssignment height={payload[3] if isinstance(payload,list) and len(payload)>3 else '?'}")
                 pool.current_job = payload
-                # pearl/v1: alpha-miner skips subscribe/authorize — send job immediately
+                # pearl/v1: send job after configure ACK
                 if session.configured:
                     await session.send_difficulty(1.0)
+                    await session.send_pearl_mining_params()
                     await session.send_notify(payload)
                 else:
                     session.job_buffer = [payload]
