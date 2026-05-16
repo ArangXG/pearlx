@@ -197,9 +197,10 @@ class StratumSession:
         self.pending: dict = {}    # id → method
         self.job_id = ""
         self.submit_count = 0
-        self.subscribed  = False   # set after mining.subscribe
-        self.authorized  = False   # set after mining.authorize
-        self.job_buffer  = []      # hold jobs until handshake complete
+        self.configured = False    # set after mining.configure ACK
+        self.subscribed  = False
+        self.authorized  = False
+        self.job_buffer  = []
 
     # ── Send helpers ──────────────────────────────────────────────────────────
 
@@ -213,47 +214,51 @@ class StratumSession:
         await self.send({"id": id_, "result": result, "error": error})
 
     async def send_notify(self, job):
-        """Send mining.notify to alpha-miner with job from pool.
-        JobAssignment = [job_id, matrix_bytes, height, diff_bits, merkle_root, extra, nonce_start]
+        """Send mining.notify to alpha-miner.
+        Confirmed JobAssignment layout (from MitM capture):
+          [0] job_uuid  (str)
+          [1] sigma     (bytes, 76B)
+          [2] target_nbits (int, e.g. 0x1B020000)
+          [3] height    (int)
+          [4] merkle    (bytes, 32B)
+          [5] extra     (bytes, empty)
+          [6] network_nbits (int)
         """
         if isinstance(job, list):
-            job_id      = str(job[0])                                               # UUID
-            matrix_hex  = job[1].hex() if isinstance(job[1], bytes) else str(job[1])  # challenge data
-            height      = job[2] if len(job) > 2 else 0                            # block height
-            diff_bits   = job[3] if len(job) > 3 else 0                            # difficulty
+            job_id      = str(job[0])
+            sigma_hex   = job[1].hex() if isinstance(job[1], bytes) else str(job[1])
+            target_bits = job[2] if len(job) > 2 else 0   # e.g. 0x1B020000
+            height      = job[3] if len(job) > 3 else 0
             merkle_hex  = job[4].hex() if len(job) > 4 and isinstance(job[4], bytes) else ""
-            nonce_start = job[6] if len(job) > 6 else 0                            # nonce start
+            net_bits    = job[6] if len(job) > 6 else 0
         else:
-            job_id      = str(job.get("job_id", job.get("id", "0")))
-            matrix_hex  = job.get("matrix", job.get("seed", ""))
+            job_id      = str(job.get("job_id", "0"))
+            sigma_hex   = job.get("sigma", "")
+            target_bits = job.get("target_bits", 0)
             height      = job.get("height", 0)
-            diff_bits   = job.get("diff_bits", 0)
             merkle_hex  = job.get("merkle", "")
-            nonce_start = job.get("nonce_start", 0)
+            net_bits    = 0
 
-        self.job_id        = job_id
-        self.current_job   = job
-        self.matrix_hex    = matrix_hex
-        self.height        = height
-        self.merkle_hex    = merkle_hex
+        self.job_id      = job_id
+        self.current_job = job
 
-        # Stratum mining.notify params for pearl/v1:
-        # [job_id, height_hex, matrix_data_hex, merkle_root_hex, nonce_start_hex, diff_bits, clean_jobs]
+        # pearl/v1 mining.notify params:
+        # [job_id, sigma_hex, height, target_nbits_hex, merkle_hex, network_nbits_hex, clean_jobs]
         params = [
             job_id,
-            f"{height:08x}",
-            matrix_hex,
+            sigma_hex,
+            height,
+            f"{target_bits:08x}",
             merkle_hex,
-            f"{nonce_start:08x}",
-            diff_bits,
-            True,   # clean jobs
+            f"{net_bits:08x}",
+            True,
         ]
         await self.send({
             "id": None,
             "method": "mining.notify",
             "params": params,
         })
-        log.info(f"📢 mining.notify job_id={job_id} height={height} diff={diff_bits}")
+        log.info(f"📢 mining.notify job={job_id} height={height} nbits={target_bits:#010x}")
 
 
     async def send_difficulty(self, diff: float):
@@ -270,12 +275,19 @@ class StratumSession:
         extensions = params[0] if params else []
         result = {}
         if "pearl/v1" in extensions:
-            # Advertise mining shape parameters (from alpha-miner logs)
             result["pearl/v1"] = {
                 "m": 131072, "n": 131072, "k": 4096, "rank": 128
             }
         await self.send_result(id_, result)
+        self.configured = True
         log.info("⚙️  mining.configure → pearl/v1 ACK")
+        # pearl/v1 skips subscribe/authorize — flush any buffered job now
+        if self.job_buffer:
+            job = self.job_buffer[-1]
+            self.job_buffer.clear()
+            log.info("📬 Flushing buffered job after configure")
+            await self.send_difficulty(1.0)
+            await self.send_notify(job)
 
     async def handle_subscribe(self, id_, params):
         """mining.subscribe — return session info."""
@@ -412,28 +424,22 @@ async def pool_recv_loop(pool: PoolConnection, session: StratumSession):
             if type_id == T_REGISTER_RESPONSE:
                 pool.registered = True
                 log.info(f"✅ RegisterResponse: {payload}")
-                # payload = [success, session_id, block_height, job_uuid]
-                if isinstance(payload, list):
-                    success    = payload[0] if len(payload) > 0 else False
-                    session_id = payload[1] if len(payload) > 1 else ""
-                    # diff/height from pool, use default stratum diff 1
-                    if not success:
-                        log.error("❌ Pool rejected registration!")
-                        break
-                else:
-                    success = payload.get("success", True) if isinstance(payload, dict) else True
-                await session.send_difficulty(1.0)
+                if isinstance(payload, list) and len(payload) > 0 and not payload[0]:
+                    log.error("❌ Pool rejected registration!")
+                    break
                 log.info(f"✅ Registered! session={payload[1] if isinstance(payload,list) else ''}")
+                # DO NOT send set_difficulty yet — wait until we send a job
 
             elif type_id == T_JOB_ASSIGNMENT:
-                log.info(f"📋 JobAssignment: {str(payload)[:120]}...")
+                log.info(f"📋 JobAssignment height={payload[3] if isinstance(payload,list) and len(payload)>3 else '?'}")
                 pool.current_job = payload
-                if session.subscribed and session.authorized:
+                # pearl/v1: alpha-miner skips subscribe/authorize — send job immediately
+                if session.configured:
+                    await session.send_difficulty(1.0)
                     await session.send_notify(payload)
                 else:
-                    # Buffer latest job — will be sent after subscribe+authorize
                     session.job_buffer = [payload]
-                    log.info(f"   ⏳ Buffered (waiting for miner subscribe+authorize)")
+                    log.info(f"   ⏳ Buffered (waiting for mining.configure ACK)")
 
             elif type_id == T_SHARE_RESULT:
                 # ✅ CONFIRMED FORMAT: [share_uuid, outcome_code, message_str]
