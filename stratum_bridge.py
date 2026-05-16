@@ -83,7 +83,13 @@ OUTCOME_INVALID   = 4
 # Wire format: [4-byte big-endian uint32 length][msgpack body]
 # Body format: [type_id, {fields}]  (MessagePack union array)
 
-def encode_frame(type_id: int, payload: Any, use_str_keys=True) -> bytes:
+def encode_frame(type_id: int, payload: Any) -> bytes:
+    # Confirmed format from pool hex decode:
+    # 4-byte big-endian length + msgpack([int32(type_id), payload])
+    # Pool sends type_id as int32 (d2 000000XX), we match that
+    packer = msgpack.Packer(use_bin_type=True)
+    body = packer.pack([msgpack.ExtType(0, struct.pack(">i", type_id)), payload])
+    # Fallback: simple pack (pool decoder should handle both)
     body = msgpack.packb([type_id, payload], use_bin_type=True)
     return struct.pack(">I", len(body)) + body
 
@@ -132,13 +138,17 @@ class PoolConnection:
         return type_id, payload
 
     async def register(self, wallet: str, worker: str):
+        # Try array format first (matches pool's PoolError array payload style)
+        # Format options based on binary analysis:
+        # Option A: {"wallet":..., "worker":..., "version":...}
+        # Option B: [wallet, worker, version]
         payload = {
-            "wallet": wallet,
-            "worker": worker,
+            "wallet":  wallet,
+            "worker":  worker,
             "version": MINER_VERSION,
         }
         await self.send(T_REGISTER_REQUEST, payload)
-        log.info(f"📤 RegisterRequest sent (wallet={wallet[:20]}... worker={worker})")
+        log.info(f"📤 RegisterRequest sent wallet={wallet[:16]}... worker={worker}")
 
     async def submit_share(self, job_id, proof_data: dict):
         await self.send(T_PLAIN_PROOF_SHARE, proof_data)
@@ -223,18 +233,9 @@ class StratumSession:
         log.info("📡 mining.subscribe → session established")
 
     async def handle_authorize(self, id_, params):
-        """mining.authorize — extract wallet+worker, register with pool."""
-        raw_worker = params[0] if params else "unknown.worker"
-        parts = raw_worker.split(".", 1)
-        self.wallet = parts[0] if len(parts) == 1 else self.pool.wallet_hint
-        self.worker = parts[1] if len(parts) > 1 else parts[0]
-        # If wallet not parsed (alpha-miner uses wallet.worker format)
-        if not self.wallet.startswith("prl1") and hasattr(self.pool, 'wallet_hint'):
-            self.wallet = self.pool.wallet_hint
+        """mining.authorize — RegisterRequest already sent at connect time."""
         await self.send_result(id_, True)
-        log.info(f"🔑 mining.authorize → wallet={self.wallet[:20]}... worker={self.worker}")
-        # Register with pool
-        await self.pool.register(self.wallet, self.worker)
+        log.info(f"🔑 mining.authorize → ACK (already registered with pool)")
 
     async def handle_submit(self, id_, params):
         """mining.submit — translate proof to PlainProofShare."""
@@ -401,17 +402,16 @@ async def handle_miner(reader, writer, pool_host, pool_port, wallet_hint, worker
 
     try:
         await pool.connect()
+        # ✅ Send RegisterRequest IMMEDIATELY — pool has 10s timeout!
+        await pool.register(wallet_hint, worker_hint)
     except Exception as e:
         log.error(f"Cannot connect to pool: {e}")
         writer.close()
         return
 
     session = StratumSession(reader, writer, pool)
-    # Pre-fill wallet if provided via args
-    if wallet_hint:
-        session.wallet = wallet_hint
-    if worker_hint:
-        session.worker = worker_hint
+    session.wallet = wallet_hint
+    session.worker = worker_hint
 
     await asyncio.gather(
         session.run(),
