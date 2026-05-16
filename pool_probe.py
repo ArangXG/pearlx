@@ -61,34 +61,39 @@ async def probe(name: str, body: bytes, timeout=4):
         print(f"  ERROR: {e}")
 
 async def main():
-    reg_str_keys = {"wallet": WALLET, "worker": WORKER, "version": "1.0.0"}
-    reg_int_keys = {0: WALLET, 1: WORKER, 2: "1.0.0"}
+    wallet = WALLET
+    worker = WORKER
+    ver    = "akoya-miner/1.0.0"
 
-    # Hypothesis A: [type_id, {str_keys}]
-    await probe("Union [0, str_keys]",
-        msgpack.packb([0, reg_str_keys], use_bin_type=True))
+    # ── Format variants to test ──────────────────────────────────────────────
+    # Pool confirmed: uses [type_id, payload] outer structure
+    # PoolError payload = [code, msg, bool] → ARRAY format
+    # So RegisterRequest payload is likely also an ARRAY
 
-    # Hypothesis B: [type_id, {int_keys}]
-    await probe("Union [0, int_keys]",
-        msgpack.packb([0, reg_int_keys], use_bin_type=True))
+    await probe("A: [0, [wallet, worker, ver]]",
+        msgpack.packb([0, [wallet, worker, ver]], use_bin_type=True))
 
-    # Hypothesis C: 1-byte type + msgpack map
-    body_c = bytes([0]) + msgpack.packb(reg_str_keys, use_bin_type=True)
-    await probe("1-byte-type + str_map", body_c)
+    await probe("B: [0, [wallet, worker]]",
+        msgpack.packb([0, [wallet, worker]], use_bin_type=True))
 
-    # Hypothesis D: pure msgpack map (no type prefix)
-    await probe("Pure str_map",
-        msgpack.packb(reg_str_keys, use_bin_type=True))
+    await probe("C: [0, {0:wallet, 1:worker, 2:ver}] int-map",
+        msgpack.packb([0, {0: wallet, 1: worker, 2: ver}], use_bin_type=True))
 
-    # Hypothesis E: msgpack map with "type" field
-    await probe("Map with 'type' field",
-        msgpack.packb({"type": 0, **reg_str_keys}, use_bin_type=True))
+    await probe("D: [0, {0:wallet, 1:worker}] int-map no ver",
+        msgpack.packb([0, {0: wallet, 1: worker}], use_bin_type=True))
 
-    # Hypothesis F: msgpack map with 'type' = 'RegisterRequest'
-    await probe("Map with 'type'=RegisterRequest",
-        msgpack.packb({"type": "RegisterRequest", **reg_str_keys}, use_bin_type=True))
+    await probe("E: [0, {str-keys}] dict",
+        msgpack.packb([0, {"wallet": wallet, "worker": worker, "version": ver}], use_bin_type=True))
+
+    await probe("F: [0, [ver, wallet, worker]] ver-first",
+        msgpack.packb([0, [ver, wallet, worker]], use_bin_type=True))
+
+    await probe("G: [0, {'address':wallet,'worker':worker,'software':ver}]",
+        msgpack.packb([0, {"address": wallet, "worker": worker, "software": ver}], use_bin_type=True))
 
     print("\n" + "="*60)
-    print("  Probe complete. Check output above to determine correct format.")
+    print("  Probe complete. Format that gets RegisterResponse = correct one!")
+    print("  Format that gets PoolError code=1 (InvalidRegistration) = wrong payload.")
+    print("  Format that gets PoolError code=2 = wrong type_id.")
 
 asyncio.run(main())

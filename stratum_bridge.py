@@ -138,17 +138,25 @@ class PoolConnection:
         return type_id, payload
 
     async def register(self, wallet: str, worker: str):
-        # Try array format first (matches pool's PoolError array payload style)
-        # Format options based on binary analysis:
-        # Option A: {"wallet":..., "worker":..., "version":...}
-        # Option B: [wallet, worker, version]
-        payload = {
-            "wallet":  wallet,
-            "worker":  worker,
-            "version": MINER_VERSION,
-        }
+        # Pool uses ARRAY format for payloads (confirmed: PoolError=[code,msg,bool])
+        # RegisterRequest = [wallet, worker, version] as array
+        # We try 3 formats in sequence based on probability:
+        format_id = getattr(self, '_reg_format', 0)
+
+        if format_id == 0:
+            # Most likely: [wallet, worker, version_string]
+            payload = [wallet, worker, MINER_VERSION]
+            log.info(f"📤 RegisterRequest (fmt=array) wallet={wallet[:16]}... worker={worker}")
+        elif format_id == 1:
+            # Alt: {0: wallet, 1: worker, 2: version} (int-keyed map)
+            payload = {0: wallet, 1: worker, 2: MINER_VERSION}
+            log.info(f"📤 RegisterRequest (fmt=int-map) wallet={wallet[:16]}... worker={worker}")
+        else:
+            # Alt: [version, wallet, worker] different order
+            payload = [MINER_VERSION, wallet, worker]
+            log.info(f"📤 RegisterRequest (fmt=array-v2) wallet={wallet[:16]}... worker={worker}")
+
         await self.send(T_REGISTER_REQUEST, payload)
-        log.info(f"📤 RegisterRequest sent wallet={wallet[:16]}... worker={worker}")
 
     async def submit_share(self, job_id, proof_data: dict):
         await self.send(T_PLAIN_PROOF_SHARE, proof_data)
