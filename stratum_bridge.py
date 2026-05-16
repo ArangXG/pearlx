@@ -97,7 +97,7 @@ def encode_frame(type_id: int, payload: Any) -> bytes:
 async def recv_frame(reader: asyncio.StreamReader) -> Tuple[int, Any]:
     hdr = await reader.readexactly(4)
     length = struct.unpack(">I", hdr)[0]
-    if length > 1024 * 1024:
+    if length > 4 * 1024 * 1024:
         raise ValueError(f"Frame too large: {length}")
     raw = await reader.readexactly(length)
     log.debug(f"  raw hex: {raw[:64].hex()}{'...' if len(raw)>64 else ''}")
@@ -370,10 +370,9 @@ class StratumSession:
 # ── Pool Receive Loop ─────────────────────────────────────────────────────────
 async def pool_recv_loop(pool: PoolConnection, session: StratumSession):
     """Receive messages from pool and translate back to Stratum for miner."""
-    # Heartbeat disabled: we don't know exact format yet (wrong format = instant disconnect)
-    # Pool tolerates ~5 min without heartbeat. Will re-enable once format is confirmed.
-    HEARTBEAT_DISABLED = True
-    heartbeat_interval = 600
+    # Heartbeat: pool disconnects after ~90s without HB. Send [] payload.
+    # NOTE: will capture exact Heartbeat format in next MitM run (90s timeout).
+    heartbeat_interval = 60
     last_heartbeat = time.time()
 
     while True:
@@ -413,29 +412,55 @@ async def pool_recv_loop(pool: PoolConnection, session: StratumSession):
                 await session.send_notify(payload)
 
             elif type_id == T_SHARE_RESULT:
-                outcome = payload.get("outcome", payload.get("result", -1)) if isinstance(payload, dict) else payload
-                if outcome == OUTCOME_ACCEPTED or outcome == 0:
-                    log.info(f"✅ Share ACCEPTED! {payload}")
+                # ✅ CONFIRMED FORMAT: [share_uuid, outcome_code, message_str]
+                # e.g. ['5960d0f8-...', 0, 'Accepted']
+                if isinstance(payload, list) and len(payload) >= 2:
+                    share_id = payload[0]
+                    outcome  = payload[1]
+                    msg_str  = payload[2] if len(payload) > 2 else ""
                 else:
-                    outcome_names = {1:"Rejected", 2:"Stale", 3:"Duplicate", 4:"Invalid", 5:"RateLimited"}
-                    log.warning(f"❌ Share {outcome_names.get(outcome,'Unknown')}({outcome}): {payload}")
+                    share_id = ""
+                    outcome  = payload.get("outcome", -1) if isinstance(payload, dict) else -1
+                    msg_str  = ""
+
+                if outcome == OUTCOME_ACCEPTED:
+                    log.info(f"✅ Share ACCEPTED! id={share_id} msg={msg_str}")
+                    # Notify miner of accepted share (find pending submit id)
+                    await session.send_result(None, True)
+                else:
+                    outcome_names = {1:"Rejected", 2:"Stale", 3:"Duplicate", 4:"Invalid"}
+                    log.warning(f"❌ Share {outcome_names.get(outcome,str(outcome))}: id={share_id} msg={msg_str}")
+                    await session.send_result(None, False)
 
             elif type_id == T_DIFFICULTY_ADJUST:
-                diff = payload.get("difficulty", pool.difficulty) if isinstance(payload, dict) else float(payload)
+                # ✅ CONFIRMED FORMAT: [new_difficulty_int]  e.g. [453019458]
+                if isinstance(payload, list) and len(payload) > 0:
+                    diff = float(payload[0])
+                elif isinstance(payload, dict):
+                    diff = float(payload.get("difficulty", pool.difficulty))
+                else:
+                    diff = float(payload)
                 pool.difficulty = diff
                 log.info(f"⚡ DifficultyAdjust → {diff}")
-                await session.send_difficulty(diff)
+                # Send as stratum difficulty (normalize to reasonable range)
+                await session.send_difficulty(1.0)
 
             elif type_id == T_HEARTBEAT_ACK:
                 log.debug("💓 HeartbeatAck")
 
             elif type_id == T_POOL_ERROR:
-                code = payload.get("code", "?") if isinstance(payload, dict) else payload
-                msg_ = payload.get("message", "") if isinstance(payload, dict) else ""
-                log.error(f"🚨 PoolError code={code}: {msg_}")
-                # If UnsupportedProtocol, log hint
-                if code in ("UnsupportedProtocol", 2):
-                    log.error("  → Protocol format mismatch. Run pool_probe.py to detect correct format.")
+                # ✅ CONFIRMED FORMAT: [error_code, message_str, is_fatal_bool]
+                if isinstance(payload, list):
+                    code  = payload[0] if len(payload) > 0 else "?"
+                    msg_  = payload[1] if len(payload) > 1 else ""
+                    fatal = payload[2] if len(payload) > 2 else False
+                else:
+                    code  = payload.get("code", "?") if isinstance(payload, dict) else payload
+                    msg_  = payload.get("message", "") if isinstance(payload, dict) else ""
+                    fatal = False
+                log.error(f"🚨 PoolError code={code}: {msg_} (fatal={fatal})")
+                if fatal:
+                    break
 
             elif type_id == T_BLOCK_SUBMISSION_RESULT:
                 log.info(f"🎉 BlockSubmission: {payload}")
