@@ -287,7 +287,11 @@ class StratumSession:
             result["pearl/v1"] = True
         await self.send_result(id_, result)
         self.configured = True
-        log.info("⚙️  mining.configure → pearl/v1:true ACK (waiting for subscribe...)")
+        log.info("⚙️  mining.configure → pearl/v1:true ACK")
+        # ✅ Send pearl.set_mining_params IMMEDIATELY after configure ACK
+        # Alpha-miner waits for this before sending subscribe
+        await self.send_pearl_mining_params()
+        # mining.notify will be sent after subscribe
 
     async def handle_subscribe(self, id_, params):
         """mining.subscribe — return session info."""
@@ -303,7 +307,7 @@ class StratumSession:
         await self._flush_job_buffer()
 
     async def _flush_job_buffer(self):
-        """Send params+notify once subscribed (authorize optional for pearl/v1)."""
+        """Send notify once subscribed (after subscribe ACK)."""
         if not self.subscribed:
             return
         if self.job_buffer:
@@ -311,7 +315,6 @@ class StratumSession:
             self.job_buffer.clear()
             log.info("📬 Sending buffered job (post-subscribe)")
             await self.send_difficulty(1.0)
-            await self.send_pearl_mining_params()
             await self.send_notify(job)
 
     async def handle_authorize(self, id_, params):
@@ -443,10 +446,9 @@ async def pool_recv_loop(pool: PoolConnection, session: StratumSession):
             elif type_id == T_JOB_ASSIGNMENT:
                 log.info(f"📋 JobAssignment height={payload[3] if isinstance(payload,list) and len(payload)>3 else '?'}")
                 pool.current_job = payload
-                # pearl/v1: wait for subscribe before sending job
+                # pearl/v1: wait for subscribe before sending notify
                 if session.subscribed:
                     await session.send_difficulty(1.0)
-                    await session.send_pearl_mining_params()
                     await session.send_notify(payload)
                 else:
                     session.job_buffer = [payload]  # keep latest
