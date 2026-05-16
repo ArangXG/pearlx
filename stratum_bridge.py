@@ -208,20 +208,48 @@ class StratumSession:
         await self.send({"id": id_, "result": result, "error": error})
 
     async def send_notify(self, job):
-        """Send mining.notify to alpha-miner with job from pool."""
-        # job from pool is a JobAssignment dict
-        # We translate to Stratum mining.notify params
-        job_id    = str(job.get("job_id", job.get("id", "0")))
-        target    = job.get("target", job.get("difficulty", "0" * 64))
-        seed      = job.get("seed",   job.get("matrix_seed", ""))
-        params = [job_id, target, seed, True]  # True = clean jobs
-        self.job_id = job_id
+        """Send mining.notify to alpha-miner with job from pool.
+        JobAssignment = [job_id, matrix_bytes, height, diff_bits, merkle_root, extra, nonce_start]
+        """
+        if isinstance(job, list):
+            job_id      = str(job[0])                                               # UUID
+            matrix_hex  = job[1].hex() if isinstance(job[1], bytes) else str(job[1])  # challenge data
+            height      = job[2] if len(job) > 2 else 0                            # block height
+            diff_bits   = job[3] if len(job) > 3 else 0                            # difficulty
+            merkle_hex  = job[4].hex() if len(job) > 4 and isinstance(job[4], bytes) else ""
+            nonce_start = job[6] if len(job) > 6 else 0                            # nonce start
+        else:
+            job_id      = str(job.get("job_id", job.get("id", "0")))
+            matrix_hex  = job.get("matrix", job.get("seed", ""))
+            height      = job.get("height", 0)
+            diff_bits   = job.get("diff_bits", 0)
+            merkle_hex  = job.get("merkle", "")
+            nonce_start = job.get("nonce_start", 0)
+
+        self.job_id        = job_id
+        self.current_job   = job
+        self.matrix_hex    = matrix_hex
+        self.height        = height
+        self.merkle_hex    = merkle_hex
+
+        # Stratum mining.notify params for pearl/v1:
+        # [job_id, height_hex, matrix_data_hex, merkle_root_hex, nonce_start_hex, diff_bits, clean_jobs]
+        params = [
+            job_id,
+            f"{height:08x}",
+            matrix_hex,
+            merkle_hex,
+            f"{nonce_start:08x}",
+            diff_bits,
+            True,   # clean jobs
+        ]
         await self.send({
             "id": None,
             "method": "mining.notify",
             "params": params,
         })
-        log.info(f"📢 Sent mining.notify job_id={job_id}")
+        log.info(f"📢 mining.notify job_id={job_id} height={height} diff={diff_bits}")
+
 
     async def send_difficulty(self, diff: float):
         await self.send({
@@ -361,10 +389,18 @@ async def pool_recv_loop(pool: PoolConnection, session: StratumSession):
             if type_id == T_REGISTER_RESPONSE:
                 pool.registered = True
                 log.info(f"✅ RegisterResponse: {payload}")
-                # Send initial difficulty
-                diff = float(payload.get("difficulty", payload.get("diff", 1.0))) if isinstance(payload, dict) else 1.0
-                pool.difficulty = diff
-                await session.send_difficulty(diff)
+                # payload = [success, session_id, block_height, job_uuid]
+                if isinstance(payload, list):
+                    success    = payload[0] if len(payload) > 0 else False
+                    session_id = payload[1] if len(payload) > 1 else ""
+                    # diff/height from pool, use default stratum diff 1
+                    if not success:
+                        log.error("❌ Pool rejected registration!")
+                        break
+                else:
+                    success = payload.get("success", True) if isinstance(payload, dict) else True
+                await session.send_difficulty(1.0)
+                log.info(f"✅ Registered! session={payload[1] if isinstance(payload,list) else ''}")
 
             elif type_id == T_JOB_ASSIGNMENT:
                 log.info(f"📋 JobAssignment: {payload}")
