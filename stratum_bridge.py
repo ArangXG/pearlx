@@ -84,14 +84,15 @@ OUTCOME_INVALID   = 4
 # Body format: [type_id, {fields}]  (MessagePack union array)
 
 def encode_frame(type_id: int, payload: Any) -> bytes:
-    # Confirmed format from pool hex decode:
-    # 4-byte big-endian length + msgpack([int32(type_id), payload])
-    # Pool sends type_id as int32 (d2 000000XX), we match that
-    packer = msgpack.Packer(use_bin_type=True)
-    body = packer.pack([msgpack.ExtType(0, struct.pack(">i", type_id)), payload])
-    # Fallback: simple pack (pool decoder should handle both)
-    body = msgpack.packb([type_id, payload], use_bin_type=True)
-    return struct.pack(">I", len(body)) + body
+    # CONFIRMED: pool uses int32 (d2 XXXXXXXX) for type_id, NOT fixint
+    # Pool sends: 92 d2 00000008 [payload] for PoolError
+    # We must send: 92 d2 00000000 [payload] for RegisterRequest
+    #
+    # Build manually: fixarray[2] + int32(type_id) + msgpack(payload)
+    type_id_bytes = b'\xd2' + struct.pack('>i', type_id)  # int32 big-endian
+    payload_bytes = msgpack.packb(payload, use_bin_type=True)
+    body = b'\x92' + type_id_bytes + payload_bytes        # 0x92 = fixarray[2]
+    return struct.pack('>I', len(body)) + body
 
 async def recv_frame(reader: asyncio.StreamReader) -> Tuple[int, Any]:
     hdr = await reader.readexactly(4)

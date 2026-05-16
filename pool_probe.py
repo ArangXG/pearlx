@@ -31,6 +31,13 @@ def hex_dump(data: bytes, label="") -> str:
 def make_frame(body: bytes) -> bytes:
     return struct.pack(">I", len(body)) + body
 
+def make_frame_int32(type_id: int, payload_bytes: bytes) -> bytes:
+    """Build frame with int32-encoded type_id (matches pool's exact wire format)."""
+    # Pool sends: 92 d2 XXXXXXXX [payload]
+    # 0x92 = fixarray[2], 0xd2 = int32 marker
+    body = b'\x92' + b'\xd2' + struct.pack('>i', type_id) + payload_bytes
+    return struct.pack(">I", len(body)) + body
+
 async def probe(name: str, body: bytes, timeout=4):
     print(f"\n{'='*60}")
     print(f"  PROBE: {name}")
@@ -65,35 +72,41 @@ async def main():
     worker = WORKER
     ver    = "akoya-miner/1.0.0"
 
-    # ── Format variants to test ──────────────────────────────────────────────
-    # Pool confirmed: uses [type_id, payload] outer structure
-    # PoolError payload = [code, msg, bool] → ARRAY format
-    # So RegisterRequest payload is likely also an ARRAY
+    print("\n🔑 KEY INSIGHT: Pool sends type_id as int32 (d2 XXXXXXXX), not fixint!")
+    print("   Testing with int32-encoded type_id...\n")
 
-    await probe("A: [0, [wallet, worker, ver]]",
-        msgpack.packb([0, [wallet, worker, ver]], use_bin_type=True))
+    # ── All tests use int32 type_id encoding ─────────────────────────────────
+    def p(payload):
+        return make_frame_int32(0, msgpack.packb(payload, use_bin_type=True))
 
-    await probe("B: [0, [wallet, worker]]",
-        msgpack.packb([0, [wallet, worker]], use_bin_type=True))
+    await probe("INT32-A: type_id=int32, payload=[wallet,worker,ver]",
+        p([wallet, worker, ver]))
 
-    await probe("C: [0, {0:wallet, 1:worker, 2:ver}] int-map",
-        msgpack.packb([0, {0: wallet, 1: worker, 2: ver}], use_bin_type=True))
+    await probe("INT32-B: type_id=int32, payload=[wallet,worker]",
+        p([wallet, worker]))
 
-    await probe("D: [0, {0:wallet, 1:worker}] int-map no ver",
-        msgpack.packb([0, {0: wallet, 1: worker}], use_bin_type=True))
+    await probe("INT32-C: type_id=int32, payload={0:w,1:wk,2:v} int-map",
+        p({0: wallet, 1: worker, 2: ver}))
 
-    await probe("E: [0, {str-keys}] dict",
-        msgpack.packb([0, {"wallet": wallet, "worker": worker, "version": ver}], use_bin_type=True))
+    await probe("INT32-D: type_id=int32, payload={str-keys dict}",
+        p({"wallet": wallet, "worker": worker, "version": ver}))
 
-    await probe("F: [0, [ver, wallet, worker]] ver-first",
-        msgpack.packb([0, [ver, wallet, worker]], use_bin_type=True))
+    await probe("INT32-E: type_id=int32, payload=[ver,wallet,worker] ver-first",
+        p([ver, wallet, worker]))
 
-    await probe("G: [0, {'address':wallet,'worker':worker,'software':ver}]",
-        msgpack.packb([0, {"address": wallet, "worker": worker, "software": ver}], use_bin_type=True))
+    await probe("INT32-F: type_id=int32, payload={'address','worker','software'}",
+        p({"address": wallet, "worker": worker, "software": ver}))
+
+    # ── Extra: try different type_id values in case 0 is wrong ───────────────
+    print("\n🔍 Testing type_id=1 (in case RegisterRequest=1, not 0)...")
+    await probe("INT32-G: type_id=1, payload=[wallet,worker,ver]",
+        make_frame_int32(1, msgpack.packb([wallet, worker, ver], use_bin_type=True)))
 
     print("\n" + "="*60)
-    print("  Probe complete. Format that gets RegisterResponse = correct one!")
-    print("  Format that gets PoolError code=1 (InvalidRegistration) = wrong payload.")
-    print("  Format that gets PoolError code=2 = wrong type_id.")
+    print("  ✅ Format that gets RegisterResponse (type=1) = CORRECT!")
+    print("  ❌ PoolError code=1 = wrong payload structure")
+    print("  ❌ PoolError code=2 = wrong type_id")
+    print("  ❌ PoolError code=8 = InternalError/other")
+
 
 asyncio.run(main())
