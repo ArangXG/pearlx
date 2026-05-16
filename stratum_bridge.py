@@ -264,18 +264,18 @@ class StratumSession:
         })
 
     async def send_pearl_mining_params(self):
-        """✅ CONFIRMED from strings: alpha-miner waits for this before notify."""
-        # Use pool dimensions (k=2048) so proof format matches pool
+        """✅ CONFIRMED from strings: alpha-miner waits for this before notify.
+        Use k=4096 to match alpha-miner profile_k=4096.
+        """
         await self.send({
             "id": None,
             "method": "pearl.set_mining_params",
             "params": {
-                "m": 8192, "n": 32768, "k": 2048,
+                "m": 131072, "n": 131072, "k": 4096,
                 "rank": 128, "mpp": 10,
-                "rows": 2, "cols": 64,
             },
         })
-        log.info("⛏️  pearl.set_mining_params sent (k=2048)")
+        log.info("⛏️  pearl.set_mining_params sent (k=4096)")
 
     # ── Stratum message handlers ──────────────────────────────────────────────
 
@@ -288,10 +288,11 @@ class StratumSession:
         await self.send_result(id_, result)
         self.configured = True
         log.info("⚙️  mining.configure → pearl/v1:true ACK")
-        # ✅ Send pearl.set_mining_params IMMEDIATELY after configure ACK
-        # Alpha-miner waits for this before sending subscribe
+        # ✅ Send pearl.set_mining_params immediately
         await self.send_pearl_mining_params()
-        # mining.notify will be sent after subscribe
+        # alpha-miner does NOT send subscribe in pearl/v1
+        # Flush buffered job now (or it will be sent on next JobAssignment)
+        await self._flush_job_buffer()
 
     async def handle_subscribe(self, id_, params):
         """mining.subscribe — return session info."""
@@ -307,13 +308,13 @@ class StratumSession:
         await self._flush_job_buffer()
 
     async def _flush_job_buffer(self):
-        """Send notify once subscribed (after subscribe ACK)."""
-        if not self.subscribed:
+        """Send notify after params (pearl/v1 skips subscribe)."""
+        if not self.configured:
             return
         if self.job_buffer:
             job = self.job_buffer[-1]
             self.job_buffer.clear()
-            log.info("📬 Sending buffered job (post-subscribe)")
+            log.info("📬 Sending buffered job")
             await self.send_difficulty(1.0)
             await self.send_notify(job)
 
@@ -446,13 +447,13 @@ async def pool_recv_loop(pool: PoolConnection, session: StratumSession):
             elif type_id == T_JOB_ASSIGNMENT:
                 log.info(f"📋 JobAssignment height={payload[3] if isinstance(payload,list) and len(payload)>3 else '?'}")
                 pool.current_job = payload
-                # pearl/v1: wait for subscribe before sending notify
-                if session.subscribed:
+                # pearl/v1: send notify after params (no subscribe required)
+                if session.configured:
                     await session.send_difficulty(1.0)
                     await session.send_notify(payload)
                 else:
-                    session.job_buffer = [payload]  # keep latest
-                    log.info(f"   ⏳ Buffered height={payload[3] if isinstance(payload,list) and len(payload)>3 else '?'} (waiting for subscribe)")
+                    session.job_buffer = [payload]
+                    log.info(f"   ⏳ Buffered height={payload[3] if isinstance(payload,list) and len(payload)>3 else '?'} (waiting for configure)")
 
             elif type_id == T_SHARE_RESULT:
                 # ✅ CONFIRMED FORMAT: [share_uuid, outcome_code, message_str]
