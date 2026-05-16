@@ -177,7 +177,9 @@ class PoolConnection:
         log.info(f"⛏️  PlainProofShare submitted for job {job_id}")
 
     async def send_heartbeat(self):
-        await self.send(T_HEARTBEAT, {})
+        # Heartbeat payload must be array (like all other messages), not dict
+        await self.send(T_HEARTBEAT, [])
+
 
     def close(self):
         if self.writer:
