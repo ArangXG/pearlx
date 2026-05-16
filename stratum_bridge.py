@@ -218,6 +218,7 @@ class StratumSession:
     async def send_notify(self, job):
         """Send mining.notify to alpha-miner.
         JobAssignment: [job_uuid, sigma(76B), target_nbits, height, merkle(32B), extra, net_nbits]
+        Try minimal format: [job_id, sigma_hex, nbits_hex, clean]
         """
         if isinstance(job, list):
             job_id      = str(job[0])
@@ -225,27 +226,22 @@ class StratumSession:
             target_bits = job[2] if len(job) > 2 else 0
             height      = job[3] if len(job) > 3 else 0
             merkle_hex  = job[4].hex() if len(job) > 4 and isinstance(job[4], bytes) else ""
-            net_bits    = job[6] if len(job) > 6 else 0
         else:
-            job_id = str(job.get("job_id", "0"))
-            sigma_hex = job.get("sigma", "")
+            job_id      = str(job.get("job_id", "0"))
+            sigma_hex   = job.get("sigma", "")
             target_bits = job.get("target_bits", 0)
-            height = job.get("height", 0)
-            merkle_hex = job.get("merkle", "")
-            net_bits = 0
+            height      = job.get("height", 0)
+            merkle_hex  = job.get("merkle", "")
 
         self.job_id      = job_id
         self.current_job = job
 
-        # pearl/v1 notify: [job_id, sigma_hex, merkle_hex, height_hex, nbits_hex, net_hex, clean]
-        # height as hex string ("0000d117") not integer
+        # Minimal pearl/v1 notify: [job_id, sigma_hex, nbits_hex, clean_jobs]
+        # Alpha-miner only needs the challenge (sigma) and difficulty target
         params = [
             job_id,
             sigma_hex,
-            merkle_hex,
-            f"{height:08x}",
             f"{target_bits:08x}",
-            f"{net_bits:08x}",
             True,
         ]
         await self.send({
@@ -253,7 +249,7 @@ class StratumSession:
             "method": "mining.notify",
             "params": params,
         })
-        log.info(f"📢 mining.notify job={job_id} height={height} nbits={target_bits:#010x}")
+        log.info(f"📢 mining.notify job={job_id} height={height} nbits={target_bits:#010x} [4-param]")
 
 
     async def send_difficulty(self, diff: float):
@@ -290,6 +286,8 @@ class StratumSession:
         log.info("⚙️  mining.configure → pearl/v1:true ACK")
         # ✅ Send pearl.set_mining_params immediately
         await self.send_pearl_mining_params()
+        # Small delay: let alpha-miner process params before notify
+        await asyncio.sleep(0.15)
         # alpha-miner does NOT send subscribe in pearl/v1
         # Flush buffered job now (or it will be sent on next JobAssignment)
         await self._flush_job_buffer()
