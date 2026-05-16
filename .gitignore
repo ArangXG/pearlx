@@ -1,0 +1,12 @@
+# Downloaded binary — jangan di-commit ke git
+alpha-miner
+akoya-miner-1.0.0-portable/
+akoya-miner-1.0.0-portable.tar.gz
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# Logs
+*.log
