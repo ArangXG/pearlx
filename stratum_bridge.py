@@ -197,6 +197,9 @@ class StratumSession:
         self.pending: dict = {}    # id → method
         self.job_id = ""
         self.submit_count = 0
+        self.subscribed  = False   # set after mining.subscribe
+        self.authorized  = False   # set after mining.authorize
+        self.job_buffer  = []      # hold jobs until handshake complete
 
     # ── Send helpers ──────────────────────────────────────────────────────────
 
@@ -282,12 +285,27 @@ class StratumSession:
             4,
         ]
         await self.send_result(id_, result)
+        self.subscribed = True
         log.info("📡 mining.subscribe → session established")
+        await self._flush_job_buffer()
+
+    async def _flush_job_buffer(self):
+        """Send buffered jobs once handshake complete."""
+        if not (self.subscribed and self.authorized):
+            return
+        if self.job_buffer:
+            job = self.job_buffer[-1]  # send only latest job
+            self.job_buffer.clear()
+            log.info("📬 Flushing buffered job to miner")
+            await self.send_difficulty(1.0)
+            await self.send_notify(job)
 
     async def handle_authorize(self, id_, params):
         """mining.authorize — RegisterRequest already sent at connect time."""
         await self.send_result(id_, True)
+        self.authorized = True
         log.info(f"🔑 mining.authorize → ACK (already registered with pool)")
+        await self._flush_job_buffer()
 
     async def handle_submit(self, id_, params):
         """mining.submit — translate proof to PlainProofShare."""
@@ -370,9 +388,10 @@ class StratumSession:
 # ── Pool Receive Loop ─────────────────────────────────────────────────────────
 async def pool_recv_loop(pool: PoolConnection, session: StratumSession):
     """Receive messages from pool and translate back to Stratum for miner."""
-    # Heartbeat: pool disconnects after ~90s without HB. Send [] payload.
-    # NOTE: will capture exact Heartbeat format in next MitM run (90s timeout).
-    heartbeat_interval = 60
+    # Heartbeat: pool doesn't disconnect for 90s+ without HB (confirmed via MitM).
+    # Akoya-miner itself never sends HBs in 90s window either.
+    # Disabled until we capture exact format to avoid immediate disconnect.
+    heartbeat_interval = 999999
     last_heartbeat = time.time()
 
     while True:
@@ -407,9 +426,14 @@ async def pool_recv_loop(pool: PoolConnection, session: StratumSession):
                 log.info(f"✅ Registered! session={payload[1] if isinstance(payload,list) else ''}")
 
             elif type_id == T_JOB_ASSIGNMENT:
-                log.info(f"📋 JobAssignment: {payload}")
+                log.info(f"📋 JobAssignment: {str(payload)[:120]}...")
                 pool.current_job = payload
-                await session.send_notify(payload)
+                if session.subscribed and session.authorized:
+                    await session.send_notify(payload)
+                else:
+                    # Buffer latest job — will be sent after subscribe+authorize
+                    session.job_buffer = [payload]
+                    log.info(f"   ⏳ Buffered (waiting for miner subscribe+authorize)")
 
             elif type_id == T_SHARE_RESULT:
                 # ✅ CONFIRMED FORMAT: [share_uuid, outcome_code, message_str]
