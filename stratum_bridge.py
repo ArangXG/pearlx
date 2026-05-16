@@ -22,7 +22,7 @@ import struct
 import sys
 import time
 import argparse
-import binascii
+import uuid
 from typing import Any, Optional, Tuple
 
 try:
@@ -139,25 +139,38 @@ class PoolConnection:
         return type_id, payload
 
     async def register(self, wallet: str, worker: str):
-        # Pool uses ARRAY format for payloads (confirmed: PoolError=[code,msg,bool])
-        # RegisterRequest = [wallet, worker, version] as array
-        # We try 3 formats in sequence based on probability:
-        format_id = getattr(self, '_reg_format', 0)
+        # ✅ CONFIRMED FORMAT from capture_server.py sniffing akoya-miner.bin:
+        # [type_id=0, [uuid, wallet, worker, gpu_name, common_dim, version, git_sha]]
+        client_id  = str(uuid.uuid4())
+        gpu_name   = self._detect_gpu()
+        common_dim = 2048        # K dimension akoya-miner uses
+        version    = "1.0.0"
+        git_sha    = "4fb978d0e2894a14d8652c79bd9aa0ab0ccf124c"  # akoya-miner git SHA
 
-        if format_id == 0:
-            # Most likely: [wallet, worker, version_string]
-            payload = [wallet, worker, MINER_VERSION]
-            log.info(f"📤 RegisterRequest (fmt=array) wallet={wallet[:16]}... worker={worker}")
-        elif format_id == 1:
-            # Alt: {0: wallet, 1: worker, 2: version} (int-keyed map)
-            payload = {0: wallet, 1: worker, 2: MINER_VERSION}
-            log.info(f"📤 RegisterRequest (fmt=int-map) wallet={wallet[:16]}... worker={worker}")
-        else:
-            # Alt: [version, wallet, worker] different order
-            payload = [MINER_VERSION, wallet, worker]
-            log.info(f"📤 RegisterRequest (fmt=array-v2) wallet={wallet[:16]}... worker={worker}")
-
+        payload = [client_id, wallet, worker, gpu_name, common_dim, version, git_sha]
         await self.send(T_REGISTER_REQUEST, payload)
+        log.info(f"📤 RegisterRequest sent:")
+        log.info(f"   uuid={client_id}")
+        log.info(f"   wallet={wallet[:20]}...")
+        log.info(f"   worker={worker}")
+        log.info(f"   gpu={gpu_name}")
+        log.info(f"   dim={common_dim} ver={version}")
+
+    def _detect_gpu(self) -> str:
+        """Try to get GPU name from nvidia-smi, fallback to generic."""
+        try:
+            import subprocess
+            r = subprocess.run(
+                ["nvidia-smi", "--query-gpu=name", "--format=csv,noheader,nounits"],
+                capture_output=True, text=True, timeout=3
+            )
+            name = r.stdout.strip().split("\n")[0].strip()
+            if name:
+                return name
+        except Exception:
+            pass
+        return "NVIDIA GeForce RTX 5070 Ti"  # fallback
+
 
     async def submit_share(self, job_id, proof_data: dict):
         await self.send(T_PLAIN_PROOF_SHARE, proof_data)
