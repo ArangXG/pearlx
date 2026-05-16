@@ -201,6 +201,7 @@ class StratumSession:
         self.subscribed  = False
         self.authorized  = False
         self.job_buffer  = []
+        self.pool_retry  = False   # set True to trigger pool reconnect
 
     # ── Send helpers ──────────────────────────────────────────────────────────
 
@@ -499,6 +500,9 @@ async def pool_recv_loop(pool: PoolConnection, session: StratumSession):
                     fatal = False
                 log.error(f"🚨 PoolError code={code}: {msg_} (fatal={fatal})")
                 if fatal:
+                    # Code 9 = rebalancing — signal reconnect instead of drop
+                    if code == 9 or "rebalancing" in str(msg_).lower():
+                        session.pool_retry = True
                     break
 
             elif type_id == T_BLOCK_SUBMISSION_RESULT:
@@ -523,16 +527,21 @@ async def handle_miner(reader, writer, pool_host, pool_port, wallet_hint, worker
     peer = writer.get_extra_info("peername")
     log.info(f"🔌 alpha-miner connected from {peer}")
 
-    pool = PoolConnection(pool_host, pool_port)
-    pool.wallet_hint = wallet_hint
-    pool.worker_hint = worker_hint
+    async def connect_pool():
+        for attempt in range(10):
+            p = PoolConnection(pool_host, pool_port)
+            try:
+                await p.connect()
+                await p.register(wallet_hint, worker_hint)
+                return p
+            except Exception as e:
+                log.warning(f"Pool connect attempt {attempt+1}: {e}")
+                await asyncio.sleep(3)
+        return None
 
-    try:
-        await pool.connect()
-        # ✅ Send RegisterRequest IMMEDIATELY — pool has 10s timeout!
-        await pool.register(wallet_hint, worker_hint)
-    except Exception as e:
-        log.error(f"Cannot connect to pool: {e}")
+    pool = await connect_pool()
+    if not pool:
+        log.error("❌ Cannot connect to pool")
         writer.close()
         return
 
@@ -540,11 +549,27 @@ async def handle_miner(reader, writer, pool_host, pool_port, wallet_hint, worker
     session.wallet = wallet_hint
     session.worker = worker_hint
 
-    await asyncio.gather(
-        session.run(),
-        pool_recv_loop(pool, session),
-        return_exceptions=True
-    )
+    while True:
+        session.pool_retry = False
+        await asyncio.gather(
+            session.run(),
+            pool_recv_loop(pool, session),
+            return_exceptions=True,
+        )
+        if session.pool_retry:
+            log.info("🔄 Pool rebalancing — reconnecting in 3s...")
+            pool.close()
+            await asyncio.sleep(3)
+            pool = await connect_pool()
+            if not pool:
+                log.error("❌ Reconnect failed")
+                break
+            session.pool = pool
+            session.subscribed = False
+            session.job_buffer = []
+            log.info("✅ Reconnected to pool!")
+        else:
+            break
 
     pool.close()
     log.info("Session ended")
